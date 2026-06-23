@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import WebKit
+import WebRTC
 
 enum CallState: String {
     case idle = "Idle"
@@ -35,6 +36,12 @@ final class VobizCallManager: NSObject, ObservableObject {
     private var backendBaseURL: String = ""
     private var isMuted = false
     
+    // Native WebRTC resources
+    private var peerConnectionFactory: RTCPeerConnectionFactory?
+    private var peerConnection: RTCPeerConnection?
+    private var localAudioTrack: RTCAudioTrack?
+    private var signalingClient: WebRTCSignalingClient?
+    
     private let scriptMessageNames = [
         "vobizOnRegistered",
         "vobizOnLoginFailed",
@@ -45,6 +52,12 @@ final class VobizCallManager: NSObject, ObservableObject {
         "vobizOnCallTerminated",
         "vobizLog"
     ]
+    
+    override init() {
+        super.init()
+        // Initialize WebRTC SSL on startup
+        RTCInitializeSSL()
+    }
     
     func startCall(backendURL: String, fanId: String, celebrityId: String) {
         guard state == .idle || state == .failed else {
@@ -80,13 +93,22 @@ final class VobizCallManager: NSObject, ObservableObject {
         state = .ending
         addLog("📴 Hanging up call...")
         
-        // 1. Tell WKWebView to hangup & logout / disconnect
+        // 1. Tell WKWebView to hangup & logout / disconnect (for SIP mode)
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.webView?.evaluateJavaScript("window.fancallHangup && window.fancallHangup(); window.fancallLogout && window.fancallLogout();", completionHandler: nil)
         }
         
-        // 2. Notify backend that session is ended
+        // 2. Disconnect native WebRTC signaling & peer connection
+        signalingClient?.disconnect()
+        signalingClient = nil
+        
+        peerConnection?.close()
+        peerConnection = nil
+        localAudioTrack = nil
+        peerConnectionFactory = nil
+        
+        // 3. Notify backend that session is ended
         if let sessionId = activeSessionId {
             notifyBackendCallEnded(sessionId: sessionId)
         } else {
@@ -97,6 +119,14 @@ final class VobizCallManager: NSObject, ObservableObject {
     func setMuted(_ muted: Bool) {
         self.isMuted = muted
         addLog(muted ? "🎙️ Muting microphone" : "🎙️ Unmuting microphone")
+        
+        // Mute native audio track if active
+        if let localTrack = localAudioTrack {
+            localTrack.isEnabled = !muted
+            addLog("🎙️ Native WebRTC microphone muted: \(muted)")
+        }
+        
+        // Fallback/parallel for SIP webview
         DispatchQueue.main.async { [weak self] in
             self?.webView?.evaluateJavaScript("window.fancallSetMuted && window.fancallSetMuted(\(muted ? "true" : "false"));", completionHandler: nil)
         }
@@ -124,6 +154,11 @@ final class VobizCallManager: NSObject, ObservableObject {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
             try session.setActive(true)
             addLog("🎧 AVAudioSession configured: playAndRecord, voiceChat, allowBluetoothHFP")
+            
+            // Configure RTCAudioSession for WebRTC
+            let rtcSession = RTCAudioSession.sharedInstance()
+            rtcSession.useManualAudio = false
+            
         } catch {
             addLog("⚠️ Failed to configure AVAudioSession: \(error.localizedDescription)")
         }
@@ -290,7 +325,157 @@ final class VobizCallManager: NSObject, ObservableObject {
         }
     }
     
-    // MARK: - WKWebView Registration Methods
+    // MARK: - Native WebRTC Registration Method
+    
+    private func registerWebRTCMode(roomId: String, token: String, signalingUrl: String, iceServers: [[String: Any]]) {
+        state = .registeringSIP
+        addLog("🚀 Starting Native Swift WebRTC connection...")
+        
+        guard let url = URL(string: signalingUrl) else {
+            addLog("❌ Invalid signaling URL: \(signalingUrl)")
+            state = .failed
+            return
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Cleanup any existing WKWebView or WebRTC state
+            self.cleanupWebView()
+            self.signalingClient?.disconnect()
+            self.signalingClient = nil
+            self.peerConnection?.close()
+            self.peerConnection = nil
+            self.localAudioTrack = nil
+            self.peerConnectionFactory = nil
+            
+            // Set up WebRTCSignalingClient
+            self.signalingClient = WebRTCSignalingClient(url: url, roomId: roomId, token: token)
+            
+            self.signalingClient?.onConnected = { [weak self] in
+                self?.addLog("🌐 Signaling socket connected! Joining room \(roomId)...")
+                self?.signalingClient?.sendJoin()
+            }
+            
+            self.signalingClient?.onJoined = { [weak self] in
+                guard let self = self else { return }
+                self.addLog("🌐 Joined WebRTC room successfully. Setting up PeerConnection and local offer...")
+                self.setupPeerConnection(iceServers: iceServers)
+                
+                // Immediately notify backend that media is ready on the client
+                if let sessionId = self.activeSessionId {
+                    self.notifyBackendMediaReady(sessionId: sessionId)
+                }
+                
+                self.createLocalOffer()
+            }
+            
+            self.signalingClient?.onReceivedAnswer = { [weak self] answer in
+                self?.addLog("🌐 Received SDP Answer from signaling server. Setting remote description...")
+                self?.peerConnection?.setRemoteDescription(answer) { error in
+                    if let error = error {
+                        self?.addLog("❌ Failed to set remote description: \(error.localizedDescription)")
+                    } else {
+                        self?.addLog("✅ Remote description (SDP Answer) set successfully!")
+                    }
+                }
+            }
+            
+            self.signalingClient?.onReceivedCandidate = { [weak self] candidate in
+                self?.addLog("🌐 Received remote ICE candidate from server. Adding...")
+                self?.peerConnection?.add(candidate) { error in
+                    if let error = error {
+                        self?.addLog("⚠️ Failed to add remote ICE candidate: \(error.localizedDescription)")
+                    }
+                }
+            }
+            
+            self.signalingClient?.onDisconnected = { [weak self] in
+                self?.addLog("🌐 Signaling socket disconnected.")
+            }
+            
+            self.signalingClient?.onError = { [weak self] error in
+                self?.addLog("❌ Signaling error: \(error.localizedDescription)")
+                self?.state = .failed
+                self?.cleanup()
+            }
+            
+            self.signalingClient?.onLog = { [weak self] logMsg in
+                self?.addLog(logMsg)
+            }
+            
+            self.signalingClient?.connect()
+        }
+    }
+    
+    private func setupPeerConnection(iceServers: [[String: Any]]) {
+        peerConnectionFactory = RTCPeerConnectionFactory()
+        
+        var rtcIceServers: [RTCIceServer] = []
+        for server in iceServers {
+            if let urls = server["urls"] as? [String] {
+                let username = server["username"] as? String
+                let credential = server["credential"] as? String
+                let iceServer = RTCIceServer(urlStrings: urls, username: username, credential: credential)
+                rtcIceServers.append(iceServer)
+            }
+        }
+        
+        if rtcIceServers.isEmpty {
+            addLog("⚠️ No ICE servers returned by backend. Falling back to Google STUN.")
+            rtcIceServers.append(RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"]))
+        }
+        
+        let config = RTCConfiguration()
+        config.iceServers = rtcIceServers
+        config.sdpSemantics = .unifiedPlan
+        
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        
+        peerConnection = peerConnectionFactory?.peerConnection(with: config, constraints: constraints, delegate: self)
+        addLog("✅ Native RTCPeerConnection instantiated.")
+        
+        // Add local audio track
+        let audioConstraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        let audioSource = peerConnectionFactory?.audioSource(with: audioConstraints)
+        localAudioTrack = peerConnectionFactory?.audioTrack(with: audioSource!, trackId: "audio0")
+        
+        if let localTrack = localAudioTrack {
+            localTrack.isEnabled = !isMuted
+            peerConnection?.add(localTrack, streamIds: ["stream0"])
+            addLog("✅ Local audio track added to PeerConnection.")
+        }
+    }
+    
+    private func createLocalOffer() {
+        let constraints = RTCMediaConstraints(
+            mandatoryConstraints: [
+                kRTCMediaConstraintsOfferToReceiveAudio: kRTCMediaConstraintsValueTrue,
+                kRTCMediaConstraintsOfferToReceiveVideo: kRTCMediaConstraintsValueFalse
+            ],
+            optionalConstraints: nil
+        )
+        
+        peerConnection?.offer(for: constraints) { [weak self] sdp, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.addLog("❌ Failed to create local offer: \(error.localizedDescription)")
+                return
+            }
+            guard let sdp = sdp else { return }
+            
+            self.peerConnection?.setLocalDescription(sdp) { error in
+                if let error = error {
+                    self.addLog("❌ Failed to set local description: \(error.localizedDescription)")
+                    return
+                }
+                self.addLog("✅ Local offer set successfully. Sending to signaling...")
+                self.signalingClient?.sendOffer(sdp: sdp.sdp)
+            }
+        }
+    }
+    
+    // MARK: - Legacy WKWebView Registration Methods (SIP Fallback)
     
     private func registerSIPMode(username: String, password: String, domain: String) {
         state = .registeringSIP
@@ -323,40 +508,6 @@ final class VobizCallManager: NSObject, ObservableObject {
             let htmlContent = self.htmlStringSIP(username: username, password: password, domain: domain)
             webView.loadHTMLString(htmlContent, baseURL: URL(string: "https://vobiz-demo.local/"))
             self.addLog("🌐 WKWebView initialized and loaded with VoBiz SIP Client")
-        }
-    }
-    
-    private func registerWebRTCMode(roomId: String, token: String, signalingUrl: String, iceServers: [[String: Any]]) {
-        state = .registeringSIP
-        
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.cleanupWebView()
-            
-            let contentController = WKUserContentController()
-            self.scriptMessageNames.forEach { contentController.add(self, name: $0) }
-            
-            let config = WKWebViewConfiguration()
-            config.userContentController = contentController
-            config.allowsInlineMediaPlayback = true
-            config.mediaTypesRequiringUserActionForPlayback = []
-            
-            let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 2, height: 2), configuration: config)
-            webView.isOpaque = false
-            webView.alpha = 0.01
-            webView.backgroundColor = .clear
-            webView.navigationDelegate = self
-            webView.uiDelegate = self
-            self.webView = webView
-            
-            if let window = UIApplication.shared.windows.first(where: { $0.isKeyWindow }) {
-                window.addSubview(webView)
-                window.sendSubviewToBack(webView)
-            }
-            
-            let htmlContent = self.htmlStringWebRTC(roomId: roomId, token: token, signalingUrl: signalingUrl, iceServers: iceServers)
-            webView.loadHTMLString(htmlContent, baseURL: URL(string: "https://vobiz-demo.local/"))
-            self.addLog("🌐 WKWebView initialized and loaded with WebSocket WebRTC signaling container")
         }
     }
     
@@ -419,6 +570,15 @@ final class VobizCallManager: NSObject, ObservableObject {
     private func cleanup() {
         addLog("🧼 Cleaning up active session...")
         cleanupWebView()
+        
+        // Native cleanups
+        signalingClient?.disconnect()
+        signalingClient = nil
+        peerConnection?.close()
+        peerConnection = nil
+        localAudioTrack = nil
+        peerConnectionFactory = nil
+        
         activeSessionId = nil
         activeTicketId = nil
         isMuted = false
@@ -452,7 +612,7 @@ final class VobizCallManager: NSObject, ObservableObject {
         }
     }
     
-    // MARK: - Web Page HTML Templates (SIP & WebRTC)
+    // MARK: - Legacy Web Page HTML Template (SIP only)
     
     private func htmlStringSIP(username: String, password: String, domain: String) -> String {
         return """
@@ -617,225 +777,76 @@ final class VobizCallManager: NSObject, ObservableObject {
         </html>
         """
     }
+}
+
+// MARK: - RTCPeerConnectionDelegate
+
+extension VobizCallManager: RTCPeerConnectionDelegate {
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
+        addLog("WebRTC Signaling State changed: \(stateChanged.rawValue)")
+    }
     
-    private func htmlStringWebRTC(roomId: String, token: String, signalingUrl: String, iceServers: [[String: Any]]) -> String {
-        let iceServersJson: String
-        if let data = try? JSONSerialization.data(withJSONObject: iceServers, options: []),
-           let jsonStr = String(data: data, encoding: .utf8) {
-            iceServersJson = jsonStr
-        } else {
-            iceServersJson = "[]"
+    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
+        addLog("Received remote media stream track!")
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {
+        addLog("Remote media stream removed.")
+    }
+    
+    func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {
+        addLog("WebRTC peerConnectionShouldNegotiate - Negotiation needed.")
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        var stateStr = ""
+        switch newState {
+        case .new: stateStr = "new"
+        case .checking: stateStr = "checking"
+        case .connected: stateStr = "connected"
+        case .completed: stateStr = "completed"
+        case .failed: stateStr = "failed"
+        case .disconnected: stateStr = "disconnected"
+        case .closed: stateStr = "closed"
+        case .count: stateStr = "count"
+        @unknown default: stateStr = "unknown"
         }
+        addLog("WebRTC ICE Connection State changed: \(stateStr)")
         
-        return """
-        <!doctype html>
-        <html>
-        <head>
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-        </head>
-        <body>
-          <h1 style="font-family:-apple-system,sans-serif; text-align:center; margin-top:20px;">WebRTC Connection</h1>
-          <audio id="fancallRemoteAudio" autoplay playsinline></audio>
-          
-          <script>
-          (function () {
-            const roomId = "\(roomId)";
-            const token = "\(token)";
-            const signalingUrl = "\(signalingUrl)";
-            const parsedIceServers = \(iceServersJson);
-            
-            let ws = null;
-            let pc = null;
-            let localStream = null;
-            
-            function post(name, payload) {
-              try {
-                const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers[name];
-                if (handler && handler.postMessage) handler.postMessage(payload);
-              } catch (e) {}
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if newState == .connected || newState == .completed {
+                self.addLog("📞 WebRTC E2E connected natively!")
+                self.state = .connected
+            } else if newState == .failed || newState == .disconnected {
+                self.addLog("❌ WebRTC Connection failed or disconnected.")
+                self.endCall()
             }
-
-            function nativeLog(msg) { post('vobizLog', '[JS WebRTC] ' + String(msg || '')); }
-            
-            window.fancallHangup = function () {
-              nativeLog('Hangup requested.');
-              if (ws) {
-                try { ws.send(JSON.stringify({ type: 'leave' })); } catch(e) {}
-                ws.close();
-                ws = null;
-              }
-              if (pc) {
-                pc.close();
-                pc = null;
-              }
-              if (localStream) {
-                localStream.getTracks().forEach(track => track.stop());
-                localStream = null;
-              }
-            };
-            
-            window.fancallLogout = function () {
-              window.fancallHangup();
-            };
-            
-            window.fancallSetMuted = function (muted) {
-              if (localStream) {
-                localStream.getAudioTracks().forEach(track => {
-                  track.enabled = !muted;
-                });
-                nativeLog('Microphone muted state set to: ' + muted);
-              }
-            };
-
-            async function connect() {
-              try {
-                nativeLog('Acquiring user media (mic)...');
-                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-                nativeLog('User media acquired successfully.');
-                
-                // Formulate WebSocket url
-                const socketUrl = signalingUrl + (signalingUrl.indexOf('?') !== -1 ? '&' : '?') + 'token=' + token + '&roomId=' + roomId;
-                nativeLog('Connecting to signaling server: ' + signalingUrl);
-                
-                ws = new WebSocket(socketUrl);
-                
-                ws.onopen = function () {
-                  nativeLog('Signaling socket open. Initializing PeerConnection...');
-                  setupPeerConnection();
-                };
-                
-                ws.onmessage = async function (event) {
-                  try {
-                    const data = JSON.parse(event.data);
-                    nativeLog('Received signaling message type: ' + data.type);
-                    
-                    if (data.type === 'offer') {
-                      await pc.setRemoteDescription(new RTCSessionDescription(data));
-                      nativeLog('Remote offer description set. Creating answer...');
-                      const answer = await pc.createAnswer();
-                      await pc.setLocalDescription(answer);
-                      nativeLog('Local answer set. Sending to remote...');
-                      ws.send(JSON.stringify({
-                        type: 'answer',
-                        sdp: answer.sdp
-                      }));
-                    } else if (data.type === 'answer') {
-                      await pc.setRemoteDescription(new RTCSessionDescription(data));
-                      nativeLog('Remote answer description set successfully.');
-                    } else if (data.type === 'ice-candidate') {
-                      if (data.candidate) {
-                        const candidate = new RTCIceCandidate({
-                          candidate: data.candidate.candidate || data.candidate,
-                          sdpMid: data.candidate.sdpMid,
-                          sdpMLineIndex: data.candidate.sdpMLineIndex
-                        });
-                        await pc.addIceCandidate(candidate);
-                        nativeLog('ICE candidate added successfully.');
-                      }
-                    } else if (data.type === 'joined') {
-                      nativeLog('Acknowledge: Joined room. Creating Local Offer...');
-                      createLocalOffer();
-                    } else if (data.type === 'left' || data.type === 'disconnected') {
-                      nativeLog('Signaling reports remote left.');
-                      post('vobizOnCallTerminated', 'ended');
-                    }
-                  } catch (err) {
-                    nativeLog('Error processing socket message: ' + err.message);
-                  }
-                };
-                
-                ws.onerror = function (err) {
-                  nativeLog('Signaling WebSocket error: ' + err.message);
-                  post('vobizOnLoginFailed', 'WebSocket connection failed');
-                };
-                
-                ws.onclose = function () {
-                  nativeLog('Signaling WebSocket closed.');
-                };
-                
-              } catch (err) {
-                nativeLog('Failed to start WebRTC E2E: ' + err.message);
-                post('vobizOnLoginFailed', err.message);
-              }
-            }
-            
-            function setupPeerConnection() {
-              const rtcConfig = {
-                iceServers: parsedIceServers.length > 0 ? parsedIceServers : [{ urls: 'stun:stun.l.google.com:19302' }],
-                sdpSemantics: 'unified-plan'
-              };
-              
-              pc = new RTCPeerConnection(rtcConfig);
-              nativeLog('RTCPeerConnection instantiated.');
-              
-              localStream.getTracks().forEach(track => {
-                pc.addTrack(track, localStream);
-              });
-              
-              pc.onicecandidate = function (event) {
-                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({
-                    type: 'ice-candidate',
-                    candidate: {
-                      candidate: event.candidate.candidate,
-                      sdpMid: event.candidate.sdpMid,
-                      sdpMLineIndex: event.candidate.sdpMLineIndex
-                    }
-                  }));
-                }
-              };
-              
-              pc.onconnectionstatechange = function () {
-                nativeLog('WebRTC connectionState: ' + pc.connectionState);
-                if (pc.connectionState === 'connected') {
-                  post('vobizOnCallAnswered', 'ok');
-                } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-                  post('vobizOnCallTerminated', 'ended');
-                }
-              };
-              
-              pc.ontrack = function (event) {
-                nativeLog('Received remote media stream track!');
-                const remoteAudio = document.getElementById('fancallRemoteAudio');
-                if (remoteAudio && event.streams && event.streams[0]) {
-                  remoteAudio.srcObject = event.streams[0];
-                  post('vobizOnRemoteAudioAttached', 'attached');
-                }
-              };
-              
-              // Register WebRTC Ready State
-              post('vobizOnRegistered', 'ok');
-              
-              // Send join message
-              setTimeout(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({ type: 'join' }));
-                  nativeLog('Sent join message.');
-                }
-              }, 500);
-            }
-            
-            async function createLocalOffer() {
-              try {
-                const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
-                await pc.setLocalDescription(offer);
-                nativeLog('Local offer set. Sending offer via signaling...');
-                ws.send(JSON.stringify({
-                  type: 'offer',
-                  sdp: offer.sdp
-                }));
-              } catch (err) {
-                nativeLog('Failed to create local offer: ' + err.message);
-              }
-            }
-            
-            if (document.readyState === 'complete') connect();
-            else window.addEventListener('load', connect);
-          })();
-          </script>
-        </body>
-        </html>
-        """
+        }
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
+        var stateStr = ""
+        switch newState {
+        case .new: stateStr = "new"
+        case .gathering: stateStr = "gathering"
+        case .complete: stateStr = "complete"
+        @unknown default: stateStr = "unknown"
+        }
+        addLog("WebRTC ICE Gathering State: \(stateStr)")
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+        addLog("Generated local ICE candidate: \(candidate.sdp)")
+        signalingClient?.sendCandidate(candidate)
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {
+        addLog("Removed ICE candidates.")
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
+        addLog("Data channel opened.")
     }
 }
 
@@ -847,13 +858,13 @@ extension VobizCallManager: WKScriptMessageHandler {
         
         switch message.name {
         case "vobizOnRegistered":
-            addLog("🟢 SIP/WebRTC registered and ready on client!")
+            addLog("🟢 SIP registered and ready on client!")
             if let sessionId = activeSessionId {
                 notifyBackendMediaReady(sessionId: sessionId)
             }
             
         case "vobizOnLoginFailed":
-            addLog("❌ SIP/WebRTC Login Failed: \(bodyString)")
+            addLog("❌ SIP Login Failed: \(bodyString)")
             state = .failed
             cleanup()
             
@@ -877,7 +888,7 @@ extension VobizCallManager: WKScriptMessageHandler {
             cleanup()
             
         case "vobizLog":
-            print("🌐 [WebRTC Log] \(bodyString)")
+            print("🌐 [SIP Log] \(bodyString)")
             
         default:
             break
@@ -910,5 +921,180 @@ extension VobizCallManager: WKUIDelegate, WKNavigationDelegate {
     
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         addLog("❌ WebView failed navigation: \(error.localizedDescription)")
+    }
+}
+
+
+// MARK: - WebRTCSignalingClient (Native WebSocket Client)
+
+final class WebRTCSignalingClient: NSObject {
+    private var webSocket: URLSessionWebSocketTask?
+    private let url: URL
+    private let roomId: String
+    private let token: String
+    
+    var onConnected: (() -> Void)?
+    var onJoined: (() -> Void)?
+    var onReceivedOffer: ((RTCSessionDescription) -> Void)?
+    var onReceivedAnswer: ((RTCSessionDescription) -> Void)?
+    var onReceivedCandidate: ((RTCIceCandidate) -> Void)?
+    var onDisconnected: (() -> Void)?
+    var onError: ((Error) -> Void)?
+    var onLog: ((String) -> Void)?
+    
+    init(url: URL, roomId: String, token: String) {
+        self.url = url
+        self.roomId = roomId
+        self.token = token
+        super.init()
+    }
+    
+    func connect() {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var queryItems = components?.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "roomId", value: roomId))
+        queryItems.append(URLQueryItem(name: "token", value: token))
+        components?.queryItems = queryItems
+        
+        guard let finalUrl = components?.url else {
+            onError?(NSError(domain: "WebRTCSignalingClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"]))
+            return
+        }
+        
+        onLog?("🌐 Connecting to native signaling socket: \(finalUrl.absoluteString)")
+        
+        // Use a background URLSession configuration for reliable calling
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: OperationQueue())
+        webSocket = session.webSocketTask(with: finalUrl)
+        webSocket?.resume()
+        receiveMessage()
+    }
+    
+    func sendJoin() {
+        let message = ["type": "join"]
+        sendJson(message)
+    }
+    
+    func sendOffer(sdp: String) {
+        let message: [String: Any] = [
+            "type": "offer",
+            "sdp": sdp
+        ]
+        sendJson(message)
+    }
+    
+    func sendAnswer(sdp: String) {
+        let message: [String: Any] = [
+            "type": "answer",
+            "sdp": sdp
+        ]
+        sendJson(message)
+    }
+    
+    func sendCandidate(_ candidate: RTCIceCandidate) {
+        let candidatePayload: [String: Any] = [
+            "candidate": candidate.sdp,
+            "sdpMid": candidate.sdpMid ?? "",
+            "sdpMLineIndex": candidate.sdpMLineIndex
+        ]
+        let message: [String: Any] = [
+            "type": "ice-candidate",
+            "candidate": candidatePayload
+        ]
+        sendJson(message)
+    }
+    
+    func disconnect() {
+        if webSocket != nil {
+            let message = ["type": "leave"]
+            sendJson(message)
+            webSocket?.cancel(with: .normalClosure, reason: nil)
+            webSocket = nil
+        }
+    }
+    
+    private func sendJson(_ dict: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: []),
+              let jsonString = String(data: data, encoding: .utf8) else { return }
+        
+        webSocket?.send(.string(jsonString)) { [weak self] error in
+            if let error = error {
+                self?.onLog?("⚠️ Failed to send WS message: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private func receiveMessage() {
+        webSocket?.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let message):
+                switch message {
+                case .string(let text):
+                    self.handleMessageText(text)
+                case .data(let data):
+                    if let text = String(data: data, encoding: .utf8) {
+                        self.handleMessageText(text)
+                    }
+                @unknown default:
+                    break
+                }
+                self.receiveMessage()
+            case .failure(let error):
+                // Do not trigger error if connection was intentionally canceled
+                if self.webSocket != nil {
+                    self.onError?(error)
+                }
+            }
+        }
+    }
+    
+    private func handleMessageText(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+              let type = json["type"] as? String else { return }
+        
+        switch type {
+        case "joined":
+            onJoined?()
+        case "offer":
+            if let sdpString = json["sdp"] as? String {
+                let description = RTCSessionDescription(type: .offer, sdp: sdpString)
+                onReceivedOffer?(description)
+            } else if let sdpDict = json["sdp"] as? [String: Any], let sdpString = sdpDict["sdp"] as? String {
+                let description = RTCSessionDescription(type: .offer, sdp: sdpString)
+                onReceivedOffer?(description)
+            }
+        case "answer":
+            if let sdpString = json["sdp"] as? String {
+                let description = RTCSessionDescription(type: .answer, sdp: sdpString)
+                onReceivedAnswer?(description)
+            } else if let sdpDict = json["sdp"] as? [String: Any], let sdpString = sdpDict["sdp"] as? String {
+                let description = RTCSessionDescription(type: .answer, sdp: sdpString)
+                onReceivedAnswer?(description)
+            }
+        case "ice-candidate":
+            if let candidateData = json["candidate"] as? [String: Any],
+               let candidateString = candidateData["candidate"] as? String {
+                let sdpMid = candidateData["sdpMid"] as? String
+                let sdpMLineIndex = candidateData["sdpMLineIndex"] as? Int32 ?? 0
+                let rtcCandidate = RTCIceCandidate(sdp: candidateString, sdpMLineIndex: sdpMLineIndex, sdpMid: sdpMid)
+                onReceivedCandidate?(rtcCandidate)
+            }
+        case "left", "disconnected":
+            onDisconnected?()
+        default:
+            break
+        }
+    }
+}
+
+extension WebRTCSignalingClient: URLSessionWebSocketDelegate {
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        onConnected?()
+    }
+    
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        onDisconnected?()
     }
 }

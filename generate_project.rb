@@ -24,6 +24,25 @@ main_group = project.main_group.new_group('VobizDemo', 'VobizDemo')
 # Create iOS target
 target = project.new_target(:application, 'VobizDemo', :ios, '15.0', nil, :swift)
 
+# Add remote Swift package for WebRTC
+webrtc_pkg = project.new(Xcodeproj::Project::Object::XCRemoteSwiftPackageReference)
+webrtc_pkg.repositoryURL = 'https://github.com/stasel/WebRTC.git'
+webrtc_pkg.requirement = {
+  'kind' => 'upToNextMajorVersion',
+  'minimumVersion' => '119.0.0'
+}
+project.root_object.package_references << webrtc_pkg
+
+webrtc_dep = project.new(Xcodeproj::Project::Object::XCSwiftPackageProductDependency)
+webrtc_dep.package = webrtc_pkg
+webrtc_dep.product_name = 'WebRTC'
+target.package_product_dependencies << webrtc_dep
+
+# Create PBXBuildFile referencing our Swift package dependency and link it in the target's Frameworks build phase
+build_file = project.new(Xcodeproj::Project::Object::PBXBuildFile)
+build_file.product_ref = webrtc_dep
+target.frameworks_build_phase.files << build_file
+
 # Add source files
 swift_files = []
 info_plist_ref = nil
